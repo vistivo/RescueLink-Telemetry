@@ -3,6 +3,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
 from matplotlib import rcParams
 from collections import deque
+import math
 import numpy as np
 import json
 from urllib.request import urlopen
@@ -17,6 +18,27 @@ from datetime import datetime
 DATA_URL = "http://192.168.4.1/data"
 MAX_POINTS = 100
 UPDATE_INTERVAL_MS = 500
+GRAVITY_MPS2 = 9.81
+MOTION_SPIKE_THRESHOLD = 2.5
+EVENT_LOG_SIZE = 6
+
+# ─────────────────────────────────────────────
+#  EVENT LOG SETUP
+# ─────────────────────────────────────────────
+event_log = deque(maxlen=EVENT_LOG_SIZE)
+
+
+def add_event(message):
+    """
+    Adds a short mission event to the dashboard and terminal.
+    Only call this for useful status changes, not every data packet.
+    """
+    event_time = datetime.now().strftime("%H:%M:%S")
+    event_log.append((event_time, message))
+    print(f"[{event_time}] {message}")
+
+
+add_event("dashboard started")
 
 # ─────────────────────────────────────────────
 #  CSV LOGGING SETUP
@@ -49,6 +71,8 @@ if logging_enabled:
         "ax_mps2",
         "ay_mps2",
         "az_mps2",
+        "accel_magnitude",
+        "motion_spike",
         "gx_rads",
         "gy_rads",
         "gz_rads",
@@ -56,10 +80,10 @@ if logging_enabled:
         "mpu_found"
     ])
 
-    print(f"CSV logging enabled.")
+    add_event("CSV logging enabled")
     print(f"Saving data to: {log_filename}")
 else:
-    print("CSV logging disabled. Dashboard will run without recording.")
+    add_event("CSV logging disabled")
 
 # ─────────────────────────────────────────────
 #  GLOBAL THEME
@@ -78,6 +102,7 @@ PALETTE = {
     'accel_x':  '#60A5FA',
     'accel_y':  '#A78BFA',
     'accel_z':  '#34D399',
+    'accel_mag': '#FACC15',
 }
 
 rcParams.update({
@@ -108,7 +133,13 @@ ay_data       = deque(maxlen=MAX_POINTS)
 az_data       = deque(maxlen=MAX_POINTS)
 
 count = 0
-latest = {}
+latest = {"motion_spike": False}
+
+telemetry_link_live = False
+telemetry_disconnected_active = False
+sensor_error_active = False
+bad_data_active = False
+motion_spike_active = False
 
 # ─────────────────────────────────────────────
 #  FIGURE LAYOUT
@@ -117,7 +148,7 @@ fig = plt.figure(figsize=(14, 10), dpi=110)
 fig.patch.set_facecolor(BG_COLOR)
 
 fig.text(
-    0.5, 0.975, 'LIVE WIRELESS SENSOR TELEMETRY',
+    0.5, 0.975, 'RESCUELINK MISSION CONSOLE',
     ha='center', va='top',
     fontsize=15, fontweight='bold',
     color=TITLE_COLOR, fontfamily='monospace'
@@ -153,7 +184,8 @@ ax_temp  = fig.add_subplot(gs[0, 0])
 ax_press = fig.add_subplot(gs[1, 0])
 ax_hum   = fig.add_subplot(gs[2, 0])
 ax_accel = fig.add_subplot(gs[0:3, 1])
-ax_info  = fig.add_subplot(gs[3, :])
+ax_info  = fig.add_subplot(gs[3, 0])
+ax_events = fig.add_subplot(gs[3, 1])
 
 
 def style_axis(ax, title, unit, color, title_y=1.05):
@@ -181,41 +213,158 @@ def fill_under(ax, x, y, color, alpha=0.12):
 
 
 def make_status_bar(ax, latest_values):
-    ax.set_facecolor(BG_COLOR)
+    ax.set_facecolor(PANEL_COLOR)
 
     for spine in ax.spines.values():
-        spine.set_visible(False)
+        spine.set_color(GRID_COLOR)
 
     ax.set_xticks([])
     ax.set_yticks([])
 
     log_status = "ON" if logging_enabled else "OFF"
+    motion_spike = latest_values.get('motion_spike', False)
+    motion_status = "SPIKE" if motion_spike else "NOMINAL"
+    motion_color = '#FACC15' if motion_spike else '#22C55E'
 
     labels = [
-        ('TEMP',     f"{latest_values.get('temp', 0):.1f} °F",        PALETTE['temp']),
-        ('PRESSURE', f"{latest_values.get('pressure', 0):.1f} hPa",   PALETTE['pressure']),
-        ('HUMIDITY', f"{latest_values.get('humidity', 0):.1f} %",     PALETTE['humidity']),
-        ('ACCEL X',  f"{latest_values.get('ax', 0):+.3f}",            PALETTE['accel_x']),
-        ('ACCEL Y',  f"{latest_values.get('ay', 0):+.3f}",            PALETTE['accel_y']),
-        ('ACCEL Z',  f"{latest_values.get('az', 0):+.3f}",            PALETTE['accel_z']),
-        ('SAMPLES',  str(latest_values.get('count', 0)),              TICK_COLOR),
-        ('LOGGING',  log_status,                                      '#22C55E' if logging_enabled else '#EF4444'),
+        ('TEMP',      f"{latest_values.get('temp', 0):.1f} °F",        PALETTE['temp']),
+        ('PRESSURE',  f"{latest_values.get('pressure', 0):.1f}",       PALETTE['pressure']),
+        ('HUMIDITY',  f"{latest_values.get('humidity', 0):.1f} %",     PALETTE['humidity']),
+        ('ACCEL MAG', f"{latest_values.get('accel_mag', 0):.2f}",      PALETTE['accel_mag']),
+        ('MOTION',    motion_status,                                  motion_color),
+        ('ACCEL X',   f"{latest_values.get('ax', 0):+.2f}",            PALETTE['accel_x']),
+        ('ACCEL Y',   f"{latest_values.get('ay', 0):+.2f}",            PALETTE['accel_y']),
+        ('ACCEL Z',   f"{latest_values.get('az', 0):+.2f}",            PALETTE['accel_z']),
+        ('SAMPLES',   str(latest_values.get('count', 0)),              TICK_COLOR),
+        ('LOGGING',   log_status,                                      '#22C55E' if logging_enabled else '#EF4444'),
     ]
 
-    xs = np.linspace(0.02, 0.98, len(labels))
+    ax.text(
+        0.02, 0.93, 'MISSION STATUS',
+        ha='left', va='top',
+        fontsize=8, color=TITLE_COLOR, fontfamily='monospace',
+        fontweight='bold', transform=ax.transAxes
+    )
 
-    for x, (lbl, val, col) in zip(xs, labels):
+    # Two compact rows keep the bottom panel readable after adding mission data.
+    xs = np.linspace(0.08, 0.92, 5)
+
+    for index, (lbl, val, col) in enumerate(labels):
+        row = index // 5
+        column = index % 5
+        x = xs[column]
+        label_y = 0.72 if row == 0 else 0.34
+        value_y = 0.52 if row == 0 else 0.14
+
         ax.text(
-            x, 0.75, lbl,
+            x, label_y, lbl,
             ha='center', fontsize=7, color=TICK_COLOR,
             fontfamily='monospace', transform=ax.transAxes
         )
         ax.text(
-            x, 0.20, val,
-            ha='center', fontsize=11, color=col,
+            x, value_y, val,
+            ha='center', fontsize=9, color=col,
             fontfamily='monospace', fontweight='bold',
             transform=ax.transAxes
         )
+
+
+def event_color(message):
+    """
+    Picks a simple color for each event type.
+    """
+    lower_message = message.lower()
+
+    if "disconnected" in lower_message or "bad data" in lower_message or "sensor error" in lower_message:
+        return "#F97316"
+    if "motion spike" in lower_message:
+        return "#FACC15"
+    if "live" in lower_message or "enabled" in lower_message:
+        return "#22C55E"
+    if "disabled" in lower_message:
+        return "#EF4444"
+
+    return TEXT_COLOR
+
+
+def make_event_log(ax):
+    ax.set_facecolor(PANEL_COLOR)
+
+    for spine in ax.spines.values():
+        spine.set_color(GRID_COLOR)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    ax.text(
+        0.02, 0.93, 'EVENT LOG',
+        ha='left', va='top',
+        fontsize=8, color=TITLE_COLOR, fontfamily='monospace',
+        fontweight='bold', transform=ax.transAxes
+    )
+
+    if not event_log:
+        ax.text(
+            0.02, 0.55, 'NO EVENTS YET',
+            ha='left', va='center',
+            fontsize=8, color=TICK_COLOR, fontfamily='monospace',
+            transform=ax.transAxes
+        )
+        return
+
+    # Newest events appear at the top of the panel.
+    for index, (event_time, message) in enumerate(reversed(event_log)):
+        y = 0.76 - (index * 0.12)
+        ax.text(
+            0.02, y, event_time,
+            ha='left', va='center',
+            fontsize=8, color=TICK_COLOR, fontfamily='monospace',
+            transform=ax.transAxes
+        )
+        ax.text(
+            0.22, y, message.upper(),
+            ha='left', va='center',
+            fontsize=8, color=event_color(message), fontfamily='monospace',
+            transform=ax.transAxes
+        )
+
+
+def refresh_console_panels():
+    """
+    Redraws the status and event panels even when graph data is not updated.
+    """
+    ax_info.clear()
+    make_status_bar(ax_info, latest)
+
+    ax_events.clear()
+    make_event_log(ax_events)
+
+    fig.canvas.draw_idle()
+
+
+def detect_motion_spike(accel_x, accel_y, accel_z):
+    """
+    Uses acceleration magnitude to detect motion beyond normal gravity.
+    Gravity is about 9.81 m/s², so a large difference means a spike.
+    """
+    accel_magnitude = math.sqrt(accel_x ** 2 + accel_y ** 2 + accel_z ** 2)
+    motion_spike = abs(accel_magnitude - GRAVITY_MPS2) > MOTION_SPIKE_THRESHOLD
+    return accel_magnitude, motion_spike
+
+
+def show_bad_data_status():
+    """
+    Marks one bad telemetry packet without spamming repeated terminal messages.
+    """
+    global bad_data_active
+
+    if not bad_data_active:
+        add_event("bad data received")
+
+    bad_data_active = True
+    status_text.set_text("● BAD DATA")
+    status_text.set_color("#F97316")
+    refresh_console_panels()
 
 
 def read_esp32_json():
@@ -238,6 +387,8 @@ def write_csv_row(
     accel_x,
     accel_y,
     accel_z,
+    accel_magnitude,
+    motion_spike,
     gyro_x,
     gyro_y,
     gyro_z,
@@ -262,6 +413,8 @@ def write_csv_row(
         accel_x,
         accel_y,
         accel_z,
+        accel_magnitude,
+        motion_spike,
         gyro_x,
         gyro_y,
         gyro_z,
@@ -275,25 +428,53 @@ def write_csv_row(
 
 def update(_frame):
     global count
+    global telemetry_link_live, telemetry_disconnected_active
+    global sensor_error_active, bad_data_active, motion_spike_active
 
     try:
         data = read_esp32_json()
-    except (URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-        print("Network read error:", e)
+    except json.JSONDecodeError:
+        show_bad_data_status()
+        return
+    except (URLError, TimeoutError, OSError):
+        if not telemetry_disconnected_active:
+            add_event("telemetry disconnected")
+
+        telemetry_link_live = False
+        telemetry_disconnected_active = True
+        sensor_error_active = False
+        bad_data_active = False
+        motion_spike_active = False
         status_text.set_text("● DISCONNECTED")
         status_text.set_color("#EF4444")
+        refresh_console_panels()
         return
 
-    print(data)
+    if not isinstance(data, dict):
+        show_bad_data_status()
+        return
+
+    if not telemetry_link_live:
+        add_event("telemetry link live")
+
+    telemetry_link_live = True
+    telemetry_disconnected_active = False
 
     # Check sensor health flags from ESP32
     bme_found = data.get("bme_found", False)
     mpu_found = data.get("mpu_found", False)
 
     if not bme_found or not mpu_found:
+        if not sensor_error_active:
+            add_event("sensor error")
+
+        sensor_error_active = True
         status_text.set_text("● SENSOR ERROR")
         status_text.set_color("#F97316")
+        refresh_console_panels()
         return
+
+    sensor_error_active = False
 
     try:
         temp_c   = float(data["temp_c"])
@@ -308,13 +489,18 @@ def update(_frame):
         gyro_y   = float(data.get("gy_rads", 0.0))
         gyro_z   = float(data.get("gz_rads", 0.0))
 
-    except (KeyError, ValueError, TypeError) as e:
-        print("Bad data format:", e)
-        status_text.set_text("● BAD DATA")
-        status_text.set_color("#F97316")
+    except (KeyError, ValueError, TypeError):
+        show_bad_data_status()
         return
 
+    bad_data_active = False
     temp_f = (temp_c * 9 / 5) + 32
+    accel_magnitude, motion_spike = detect_motion_spike(accel_x, accel_y, accel_z)
+
+    if motion_spike and not motion_spike_active:
+        add_event("motion spike detected")
+
+    motion_spike_active = motion_spike
 
     x_data.append(count)
     temp_f_data.append(temp_f)
@@ -334,6 +520,8 @@ def update(_frame):
         accel_x=accel_x,
         accel_y=accel_y,
         accel_z=accel_z,
+        accel_magnitude=accel_magnitude,
+        motion_spike=motion_spike,
         gyro_x=gyro_x,
         gyro_y=gyro_y,
         gyro_z=gyro_z,
@@ -350,6 +538,8 @@ def update(_frame):
         ax=accel_x,
         ay=accel_y,
         az=accel_z,
+        accel_mag=accel_magnitude,
+        motion_spike=motion_spike,
         count=count
     ))
 
@@ -389,11 +579,8 @@ def update(_frame):
     ax_accel.legend(loc='upper right')
     ax_accel.set_xlabel('Sample #', fontsize=8, color=TICK_COLOR)
 
-    # Status bar
-    ax_info.clear()
-    make_status_bar(ax_info, latest)
-
-    fig.canvas.draw_idle()
+    # Mission status and event log
+    refresh_console_panels()
 
 
 print("Starting wireless live graph...")
@@ -401,6 +588,8 @@ print("Make sure your laptop is connected to the ESP32 WiFi network:")
 print("Network: RescueLink_Telemetry")
 print("URL:", DATA_URL)
 print("Close the graph window or press Ctrl+C in the terminal to stop.")
+
+refresh_console_panels()
 
 ani = FuncAnimation(fig, update, interval=UPDATE_INTERVAL_MS, cache_frame_data=False)
 
