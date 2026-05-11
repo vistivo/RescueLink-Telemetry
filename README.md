@@ -109,4 +109,4 @@ Next steps:
 
 ## Long-Term Goal
 
-The long-term goal is to expand this into RescueLink: a modular UAV mission system for search-and-rescue telemetry, mission monitoring, and situational awareness.
+The long-term goal is to expand this into Project Drone (Beacon): a modular UAV mission system for search-and-rescue telemetry, mission monitoring, and situational awareness.
