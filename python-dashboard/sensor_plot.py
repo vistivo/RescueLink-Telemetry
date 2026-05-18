@@ -133,13 +133,20 @@ ay_data       = deque(maxlen=MAX_POINTS)
 az_data       = deque(maxlen=MAX_POINTS)
 
 count = 0
-latest = {"motion_spike": False}
+mission_state = "STANDBY"
+latest = {
+    "motion_spike": False,
+    "mission_state": mission_state
+}
 
 telemetry_link_live = False
+telemetry_has_been_live = False
 telemetry_disconnected_active = False
 sensor_error_active = False
 bad_data_active = False
 motion_spike_active = False
+
+add_event(f"mission state: {mission_state}")
 
 # ─────────────────────────────────────────────
 #  FIGURE LAYOUT
@@ -212,6 +219,35 @@ def fill_under(ax, x, y, color, alpha=0.12):
         ax.fill_between(x, y, alpha=alpha, color=color)
 
 
+def mission_state_color(state):
+    """
+    Gives each mission state a clear color in the status panel.
+    """
+    if state == "ACTIVE":
+        return "#22C55E"
+    if state == "EVENT DETECTED":
+        return "#FACC15"
+    if state in ("LINK LOST", "SENSOR ERROR", "BAD DATA"):
+        return "#F97316"
+
+    return TICK_COLOR
+
+
+def set_mission_state(new_state):
+    """
+    Updates the mission state and logs it only when the state changes.
+    """
+    global mission_state
+
+    if mission_state == new_state:
+        latest["mission_state"] = mission_state
+        return
+
+    mission_state = new_state
+    latest["mission_state"] = mission_state
+    add_event(f"mission state: {mission_state}")
+
+
 def make_status_bar(ax, latest_values):
     ax.set_facecolor(PANEL_COLOR)
 
@@ -223,20 +259,15 @@ def make_status_bar(ax, latest_values):
 
     log_status = "ON" if logging_enabled else "OFF"
     motion_spike = latest_values.get('motion_spike', False)
-    motion_status = "SPIKE" if motion_spike else "NOMINAL"
-    motion_color = '#FACC15' if motion_spike else '#22C55E'
+    state = latest_values.get("mission_state", "STANDBY")
 
     labels = [
         ('TEMP',      f"{latest_values.get('temp', 0):.1f} °F",        PALETTE['temp']),
         ('PRESSURE',  f"{latest_values.get('pressure', 0):.1f}",       PALETTE['pressure']),
         ('HUMIDITY',  f"{latest_values.get('humidity', 0):.1f} %",     PALETTE['humidity']),
         ('ACCEL MAG', f"{latest_values.get('accel_mag', 0):.2f}",      PALETTE['accel_mag']),
-        ('MOTION',    motion_status,                                  motion_color),
-        ('ACCEL X',   f"{latest_values.get('ax', 0):+.2f}",            PALETTE['accel_x']),
-        ('ACCEL Y',   f"{latest_values.get('ay', 0):+.2f}",            PALETTE['accel_y']),
-        ('ACCEL Z',   f"{latest_values.get('az', 0):+.2f}",            PALETTE['accel_z']),
         ('SAMPLES',   str(latest_values.get('count', 0)),              TICK_COLOR),
-        ('LOGGING',   log_status,                                      '#22C55E' if logging_enabled else '#EF4444'),
+        ('LOG',       log_status,                                      '#22C55E' if logging_enabled else '#EF4444'),
     ]
 
     ax.text(
@@ -246,23 +277,38 @@ def make_status_bar(ax, latest_values):
         fontweight='bold', transform=ax.transAxes
     )
 
-    # Two compact rows keep the bottom panel readable after adding mission data.
-    xs = np.linspace(0.08, 0.92, 5)
+    ax.text(
+        0.5, 0.72, 'MISSION STATE',
+        ha='center', fontsize=7, color=TICK_COLOR,
+        fontfamily='monospace', transform=ax.transAxes
+    )
+    ax.text(
+        0.5, 0.49, state,
+        ha='center', fontsize=13, color=mission_state_color(state),
+        fontfamily='monospace', fontweight='bold',
+        transform=ax.transAxes
+    )
 
-    for index, (lbl, val, col) in enumerate(labels):
-        row = index // 5
-        column = index % 5
-        x = xs[column]
-        label_y = 0.72 if row == 0 else 0.34
-        value_y = 0.52 if row == 0 else 0.14
+    if motion_spike:
+        ax.text(
+            0.98, 0.93, 'MOTION SPIKE',
+            ha='right', va='top',
+            fontsize=8, color='#FACC15', fontfamily='monospace',
+            fontweight='bold', transform=ax.transAxes
+        )
+
+    # Compact telemetry row keeps the panel readable with the larger state display.
+    xs = np.linspace(0.08, 0.92, len(labels))
+
+    for x, (lbl, val, col) in zip(xs, labels):
 
         ax.text(
-            x, label_y, lbl,
+            x, 0.25, lbl,
             ha='center', fontsize=7, color=TICK_COLOR,
             fontfamily='monospace', transform=ax.transAxes
         )
         ax.text(
-            x, value_y, val,
+            x, 0.08, val,
             ha='center', fontsize=9, color=col,
             fontfamily='monospace', fontweight='bold',
             transform=ax.transAxes
@@ -275,11 +321,13 @@ def event_color(message):
     """
     lower_message = message.lower()
 
-    if "disconnected" in lower_message or "bad data" in lower_message or "sensor error" in lower_message:
+    if "disconnected" in lower_message or "link lost" in lower_message:
         return "#F97316"
-    if "motion spike" in lower_message:
+    if "bad data" in lower_message or "sensor error" in lower_message:
+        return "#F97316"
+    if "motion spike" in lower_message or "event detected" in lower_message:
         return "#FACC15"
-    if "live" in lower_message or "enabled" in lower_message:
+    if "live" in lower_message or "enabled" in lower_message or "active" in lower_message:
         return "#22C55E"
     if "disabled" in lower_message:
         return "#EF4444"
@@ -362,6 +410,7 @@ def show_bad_data_status():
         add_event("bad data received")
 
     bad_data_active = True
+    set_mission_state("BAD DATA")
     status_text.set_text("● BAD DATA")
     status_text.set_color("#F97316")
     refresh_console_panels()
@@ -428,7 +477,7 @@ def write_csv_row(
 
 def update(_frame):
     global count
-    global telemetry_link_live, telemetry_disconnected_active
+    global telemetry_link_live, telemetry_has_been_live, telemetry_disconnected_active
     global sensor_error_active, bad_data_active, motion_spike_active
 
     try:
@@ -437,7 +486,7 @@ def update(_frame):
         show_bad_data_status()
         return
     except (URLError, TimeoutError, OSError):
-        if not telemetry_disconnected_active:
+        if telemetry_has_been_live and not telemetry_disconnected_active:
             add_event("telemetry disconnected")
 
         telemetry_link_live = False
@@ -445,6 +494,12 @@ def update(_frame):
         sensor_error_active = False
         bad_data_active = False
         motion_spike_active = False
+
+        if telemetry_has_been_live:
+            set_mission_state("LINK LOST")
+        else:
+            set_mission_state("STANDBY")
+
         status_text.set_text("● DISCONNECTED")
         status_text.set_color("#EF4444")
         refresh_console_panels()
@@ -458,6 +513,7 @@ def update(_frame):
         add_event("telemetry link live")
 
     telemetry_link_live = True
+    telemetry_has_been_live = True
     telemetry_disconnected_active = False
 
     # Check sensor health flags from ESP32
@@ -469,6 +525,7 @@ def update(_frame):
             add_event("sensor error")
 
         sensor_error_active = True
+        set_mission_state("SENSOR ERROR")
         status_text.set_text("● SENSOR ERROR")
         status_text.set_color("#F97316")
         refresh_console_panels()
@@ -501,6 +558,11 @@ def update(_frame):
         add_event("motion spike detected")
 
     motion_spike_active = motion_spike
+
+    if motion_spike:
+        set_mission_state("EVENT DETECTED")
+    else:
+        set_mission_state("ACTIVE")
 
     x_data.append(count)
     temp_f_data.append(temp_f)
