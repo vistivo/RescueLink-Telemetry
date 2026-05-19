@@ -21,6 +21,9 @@ UPDATE_INTERVAL_MS = 500
 GRAVITY_MPS2 = 9.81
 MOTION_SPIKE_THRESHOLD = 2.5
 EVENT_LOG_SIZE = 6
+SEARCH_PROGRESS_PER_SECOND = 1.2
+BATTERY_DRAIN_PER_SECOND = 0.015
+TARGET_DETECTION_PROGRESS = 70.0
 
 # ─────────────────────────────────────────────
 #  EVENT LOG SETUP
@@ -73,6 +76,11 @@ if logging_enabled:
         "az_mps2",
         "accel_magnitude",
         "motion_spike",
+        "mission_mode",
+        "simulated_altitude_m",
+        "simulated_battery_pct",
+        "search_progress_pct",
+        "target_status",
         "gx_rads",
         "gy_rads",
         "gz_rads",
@@ -134,9 +142,28 @@ az_data       = deque(maxlen=MAX_POINTS)
 
 count = 0
 mission_state = "STANDBY"
+mission_mode = "STANDBY"
+simulated_altitude_m = 0.0
+simulated_battery_pct = 100.0
+search_progress_pct = 0.0
+mission_timer = "00:00"
+target_status = "NONE"
+
+mission_started = False
+target_detected = False
+mission_complete = False
+mission_start_time = None
+last_mission_update_time = None
+
 latest = {
     "motion_spike": False,
-    "mission_state": mission_state
+    "mission_state": mission_state,
+    "mission_mode": mission_mode,
+    "simulated_altitude_m": simulated_altitude_m,
+    "simulated_battery_pct": simulated_battery_pct,
+    "search_progress_pct": search_progress_pct,
+    "mission_timer": mission_timer,
+    "target_status": target_status
 }
 
 telemetry_link_live = False
@@ -180,11 +207,12 @@ status_text = fig.text(
 )
 
 gs = gridspec.GridSpec(
-    4, 2,
+    5, 2,
     figure=fig,
-    top=0.88, bottom=0.07,
+    top=0.88, bottom=0.06,
     left=0.07, right=0.97,
-    hspace=0.55, wspace=0.35
+    hspace=0.60, wspace=0.35,
+    height_ratios=[1, 1, 1, 0.85, 0.85]
 )
 
 ax_temp  = fig.add_subplot(gs[0, 0])
@@ -192,7 +220,8 @@ ax_press = fig.add_subplot(gs[1, 0])
 ax_hum   = fig.add_subplot(gs[2, 0])
 ax_accel = fig.add_subplot(gs[0:3, 1])
 ax_info  = fig.add_subplot(gs[3, 0])
-ax_events = fig.add_subplot(gs[3, 1])
+ax_uav   = fig.add_subplot(gs[3, 1])
+ax_events = fig.add_subplot(gs[4, :])
 
 
 def style_axis(ax, title, unit, color, title_y=1.05):
@@ -246,6 +275,146 @@ def set_mission_state(new_state):
     mission_state = new_state
     latest["mission_state"] = mission_state
     add_event(f"mission state: {mission_state}")
+
+
+def mission_mode_color(mode):
+    """
+    Gives the simulated UAV mission mode its own visual status color.
+    """
+    if mode == "SEARCHING":
+        return PALETTE['accel_x']
+    if mode == "TARGET DETECTED":
+        return "#FACC15"
+    if mode == "MISSION COMPLETE":
+        return "#22C55E"
+    if mode in ("LINK LOST", "SENSOR ERROR", "BAD DATA"):
+        return "#F97316"
+
+    return TICK_COLOR
+
+
+def battery_color(battery_pct):
+    """
+    Changes battery color as the simulated UAV battery drains.
+    """
+    if battery_pct > 50:
+        return "#22C55E"
+    if battery_pct > 25:
+        return "#FACC15"
+
+    return "#F97316"
+
+
+def format_mission_timer(total_seconds):
+    """
+    Turns elapsed seconds into MM:SS for the mission timer.
+    """
+    safe_seconds = max(0, int(total_seconds))
+    minutes = safe_seconds // 60
+    seconds = safe_seconds % 60
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def sync_mission_values():
+    """
+    Copies simulated mission values into the latest display dictionary.
+    """
+    global mission_timer
+
+    if mission_started and mission_start_time is not None:
+        elapsed_seconds = (datetime.now() - mission_start_time).total_seconds()
+        mission_timer = format_mission_timer(elapsed_seconds)
+
+    latest.update(dict(
+        mission_mode=mission_mode,
+        simulated_altitude_m=simulated_altitude_m,
+        simulated_battery_pct=simulated_battery_pct,
+        search_progress_pct=search_progress_pct,
+        mission_timer=mission_timer,
+        target_status=target_status
+    ))
+
+
+def set_mission_mode(new_mode):
+    """
+    Updates the simulated search mission mode without repeated event spam.
+    """
+    global mission_mode
+
+    if mission_mode != new_mode:
+        mission_mode = new_mode
+
+    sync_mission_values()
+
+
+def pause_simulated_mission(new_mode):
+    """
+    Pauses simulated search progress while telemetry is unhealthy.
+    """
+    global last_mission_update_time
+
+    set_mission_mode(new_mode)
+    last_mission_update_time = None
+
+
+def update_simulated_mission():
+    """
+    Advances the simulated UAV search mission during healthy telemetry.
+    """
+    global mission_started, mission_complete, target_detected
+    global mission_start_time, last_mission_update_time
+    global simulated_altitude_m, simulated_battery_pct
+    global search_progress_pct, mission_timer, target_status
+
+    now = datetime.now()
+
+    if not mission_started:
+        mission_started = True
+        mission_start_time = now
+        last_mission_update_time = now
+        add_event("mission started")
+        add_event("search pattern active")
+
+    if last_mission_update_time is None:
+        delta_seconds = 0
+    else:
+        delta_seconds = (now - last_mission_update_time).total_seconds()
+
+    last_mission_update_time = now
+
+    elapsed_seconds = (now - mission_start_time).total_seconds()
+    mission_timer = format_mission_timer(elapsed_seconds)
+
+    # Simulated UAV altitude gently moves but stays in a small-drone range.
+    altitude_wave = 17.0 + 4.0 * math.sin(elapsed_seconds / 8.0)
+    altitude_wave += 1.2 * math.sin(elapsed_seconds / 2.5)
+    simulated_altitude_m = min(25.0, max(10.0, altitude_wave))
+
+    if not mission_complete:
+        simulated_battery_pct = max(
+            0.0,
+            simulated_battery_pct - (delta_seconds * BATTERY_DRAIN_PER_SECOND)
+        )
+        search_progress_pct = min(
+            100.0,
+            search_progress_pct + (delta_seconds * SEARCH_PROGRESS_PER_SECOND)
+        )
+
+    if search_progress_pct >= TARGET_DETECTION_PROGRESS and not target_detected:
+        target_detected = True
+        target_status = "POSSIBLE TARGET"
+        add_event("possible target detected")
+
+    if search_progress_pct >= 100.0 and not mission_complete:
+        mission_complete = True
+        add_event("mission complete")
+
+    if mission_complete:
+        set_mission_mode("MISSION COMPLETE")
+    elif target_detected:
+        set_mission_mode("TARGET DETECTED")
+    else:
+        set_mission_mode("SEARCHING")
 
 
 def make_status_bar(ax, latest_values):
@@ -315,6 +484,73 @@ def make_status_bar(ax, latest_values):
         )
 
 
+def make_uav_mission_panel(ax, latest_values):
+    ax.set_facecolor(PANEL_COLOR)
+
+    for spine in ax.spines.values():
+        spine.set_color(GRID_COLOR)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    mode = latest_values.get("mission_mode", "STANDBY")
+    altitude = latest_values.get("simulated_altitude_m", 0.0)
+    battery = latest_values.get("simulated_battery_pct", 100.0)
+    progress = latest_values.get("search_progress_pct", 0.0)
+    timer = latest_values.get("mission_timer", "00:00")
+    target = latest_values.get("target_status", "NONE")
+
+    ax.text(
+        0.02, 0.93, 'UAV MISSION',
+        ha='left', va='top',
+        fontsize=8, color=TITLE_COLOR, fontfamily='monospace',
+        fontweight='bold', transform=ax.transAxes
+    )
+
+    ax.text(
+        0.5, 0.72, 'MISSION MODE',
+        ha='center', fontsize=7, color=TICK_COLOR,
+        fontfamily='monospace', transform=ax.transAxes
+    )
+    ax.text(
+        0.5, 0.49, mode,
+        ha='center', fontsize=13, color=mission_mode_color(mode),
+        fontfamily='monospace', fontweight='bold',
+        transform=ax.transAxes
+    )
+
+    ax.text(
+        0.98, 0.93, f"TARGET: {target}",
+        ha='right', va='top',
+        fontsize=8, color='#FACC15' if target != "NONE" else TICK_COLOR,
+        fontfamily='monospace', fontweight='bold',
+        transform=ax.transAxes
+    )
+
+    labels = [
+        ('ALT',      f"{altitude:.1f} m",       PALETTE['accel_x']),
+        ('BAT',      f"{battery:.0f} %",         battery_color(battery)),
+        ('SEARCH',   f"{progress:.0f} %",        PALETTE['humidity']),
+        ('TIMER',    timer,                      TICK_COLOR),
+    ]
+
+    # One row of mission values keeps the simulated layer compact.
+    xs = np.linspace(0.08, 0.92, len(labels))
+
+    for x, (lbl, val, col) in zip(xs, labels):
+        ax.text(
+            x, 0.25, lbl,
+            ha='center', fontsize=7, color=TICK_COLOR,
+            fontfamily='monospace', transform=ax.transAxes
+        )
+        ax.text(
+            x, 0.08, val,
+            ha='center', fontsize=9, color=col,
+            fontfamily='monospace', fontweight='bold',
+            transform=ax.transAxes
+        )
+
+
 def event_color(message):
     """
     Picks a simple color for each event type.
@@ -327,7 +563,13 @@ def event_color(message):
         return "#F97316"
     if "motion spike" in lower_message or "event detected" in lower_message:
         return "#FACC15"
+    if "possible target" in lower_message or "target detected" in lower_message:
+        return "#FACC15"
+    if "mission complete" in lower_message:
+        return "#22C55E"
     if "live" in lower_message or "enabled" in lower_message or "active" in lower_message:
+        return "#22C55E"
+    if "mission started" in lower_message:
         return "#22C55E"
     if "disabled" in lower_message:
         return "#EF4444"
@@ -384,6 +626,9 @@ def refresh_console_panels():
     ax_info.clear()
     make_status_bar(ax_info, latest)
 
+    ax_uav.clear()
+    make_uav_mission_panel(ax_uav, latest)
+
     ax_events.clear()
     make_event_log(ax_events)
 
@@ -411,6 +656,7 @@ def show_bad_data_status():
 
     bad_data_active = True
     set_mission_state("BAD DATA")
+    pause_simulated_mission("BAD DATA")
     status_text.set_text("● BAD DATA")
     status_text.set_color("#F97316")
     refresh_console_panels()
@@ -438,6 +684,11 @@ def write_csv_row(
     accel_z,
     accel_magnitude,
     motion_spike,
+    mission_mode,
+    simulated_altitude_m,
+    simulated_battery_pct,
+    search_progress_pct,
+    target_status,
     gyro_x,
     gyro_y,
     gyro_z,
@@ -464,6 +715,11 @@ def write_csv_row(
         accel_z,
         accel_magnitude,
         motion_spike,
+        mission_mode,
+        simulated_altitude_m,
+        simulated_battery_pct,
+        search_progress_pct,
+        target_status,
         gyro_x,
         gyro_y,
         gyro_z,
@@ -497,8 +753,10 @@ def update(_frame):
 
         if telemetry_has_been_live:
             set_mission_state("LINK LOST")
+            pause_simulated_mission("LINK LOST")
         else:
             set_mission_state("STANDBY")
+            pause_simulated_mission("STANDBY")
 
         status_text.set_text("● DISCONNECTED")
         status_text.set_color("#EF4444")
@@ -526,6 +784,7 @@ def update(_frame):
 
         sensor_error_active = True
         set_mission_state("SENSOR ERROR")
+        pause_simulated_mission("SENSOR ERROR")
         status_text.set_text("● SENSOR ERROR")
         status_text.set_color("#F97316")
         refresh_console_panels()
@@ -564,6 +823,8 @@ def update(_frame):
     else:
         set_mission_state("ACTIVE")
 
+    update_simulated_mission()
+
     x_data.append(count)
     temp_f_data.append(temp_f)
     pressure_data.append(pressure)
@@ -584,6 +845,11 @@ def update(_frame):
         accel_z=accel_z,
         accel_magnitude=accel_magnitude,
         motion_spike=motion_spike,
+        mission_mode=mission_mode,
+        simulated_altitude_m=simulated_altitude_m,
+        simulated_battery_pct=simulated_battery_pct,
+        search_progress_pct=search_progress_pct,
+        target_status=target_status,
         gyro_x=gyro_x,
         gyro_y=gyro_y,
         gyro_z=gyro_z,
